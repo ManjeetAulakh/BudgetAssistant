@@ -9,11 +9,16 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UsernameNotFoundException; // <-- NEW IMPORT
 import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
+
+// NEW: Added Logger Import for the fix
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Component
 @RequiredArgsConstructor
@@ -21,35 +26,58 @@ public class JwtFilter extends OncePerRequestFilter {
 
     private final JwtUtil jwtUtil;
     private final UserService userService;
+    private static final Logger logger = LoggerFactory.getLogger(JwtFilter.class); // Define logger
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
             throws ServletException, IOException {
 
-        try {
-            String jwt = parseJwt(request);
+        String jwt = parseJwt(request);
 
-            if (jwt != null && jwtUtil.validateToken(jwt)) {
-                String username = jwtUtil.getUsernameFromToken(jwt);
-
-                UserDetails userDetails = userService.loadUserByUsername(username);
-
-                // Create authentication token
-                UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
-                        userDetails, null, userDetails.getAuthorities());
-                
-                authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
-
-                // Set user as authenticated in the SecurityContext
-                SecurityContextHolder.getContext().setAuthentication(authentication);
+        if (jwt != null) {
+            String username = null;
+            try {
+                // 1. Get username from JWT
+                username = jwtUtil.getUsernameFromToken(jwt);
+            } catch (Exception e) {
+                // Log and ignore parsing errors (malformed, expired token, etc.)
+                logger.warn("JWT parsing failed for request.", e); 
+                filterChain.doFilter(request, response);
+                return;
             }
-        } catch (Exception e) {
-            logger.error("Cannot set user authentication: {}", e.getMessage());
-        }
 
+            if (username != null) {
+                UserDetails userDetails = null;
+                try {
+                    // 2. Load UserDetails from database
+                    userDetails = userService.loadUserByUsername(username);
+                    
+                    // 3. Full Validation (Signature + Username Match + Expiration)
+                    if (jwtUtil.validateToken(jwt, userDetails)) {
+                        
+                        // 4. Create and set authentication object
+                        UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
+                                userDetails, null, userDetails.getAuthorities());
+                        
+                        authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+
+                        // 5. Set user as authenticated in the SecurityContext
+                        SecurityContextHolder.getContext().setAuthentication(authentication);
+                    }
+                } catch (UsernameNotFoundException e) {
+                    // Log but allow filter chain to proceed; SecurityConfig will deny access later.
+                    logger.warn("User '{}' found in token but not in database.", username);
+                } catch (Exception e) {
+                    // Catch any other unexpected error during authentication setup
+                    logger.error("Error setting security context for user: {}", username, e);
+                }
+            }
+        }
+        
         filterChain.doFilter(request, response);
     }
-
+    
+    // ... (parseJwt method remains unchanged)
     private String parseJwt(HttpServletRequest request) {
         String headerAuth = request.getHeader("Authorization");
 
